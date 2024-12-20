@@ -1,8 +1,13 @@
-use prometheus::{Counter, IntGauge, Registry};
-use hyper::{Body, Response};
+use crate::conf;
+
+use conf::parse_args;
 use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Response};
 use prometheus::Encoder;
 use prometheus::TextEncoder;
+use prometheus::{Counter, IntGauge, Registry};
+use std::net::{IpAddr, SocketAddrV4};
+use std::str::FromStr;
 use std::{error::Error, sync::Arc};
 
 // Metrics and Observability
@@ -36,13 +41,21 @@ impl Metrics {
     }
 
     pub fn register(&self, registry: &Registry) {
-        registry.register(Box::new(self.slave_active_connections.clone())).unwrap();
-        registry.register(Box::new(self.slave_total_connections.clone())).unwrap();
-        registry.register(Box::new(self.slave_disconnections.clone())).unwrap();
+        registry
+            .register(Box::new(self.slave_active_connections.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.slave_total_connections.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.slave_disconnections.clone()))
+            .unwrap();
     }
 }
 
-pub async fn start_metrics_server(registry: Arc<Registry>) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn start_metrics_server(
+    registry: Arc<Registry>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let make_svc = make_service_fn(move |_| {
         let registry = registry.clone();
         async move {
@@ -105,8 +118,23 @@ pub async fn start_metrics_server(registry: Arc<Registry>) -> Result<(), Box<dyn
             }))
         }
     });
+    let config = parse_args();
+    let addr_parts: Vec<&str> = config.metrics_addr.split(':').collect();
 
-    let addr = ([0, 0, 0, 0], 9091).into();
+    let mut addr = ([0, 0, 0, 0], 9091).into();
+    if addr_parts.len() == 2 {
+        let ip_str = addr_parts[0];
+        let port_str = addr_parts[1];
+        if let Ok(ip_addr) = IpAddr::from_str(ip_str) {
+            if let IpAddr::V4(ipv4_addr) = ip_addr {
+                let port: u16 = port_str.parse().expect("Invalid port number");
+                let socket_addr = SocketAddrV4::new(ipv4_addr, port);
+                println!("Socket Address: {:?}", socket_addr);
+                addr = (ipv4_addr.octets(), port).into();
+            }
+        }
+    }
+
     let server = hyper::Server::bind(&addr).serve(make_svc);
 
     println!("Metrics server running on http://{}", addr);
