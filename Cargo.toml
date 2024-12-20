@@ -1,0 +1,36 @@
+[package]
+name = "net-relay"
+version = "0.4.0"
+authors = ["topsoftdeveloper@outlook.com"]
+edition = "2021"
+readme = "README.md"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+simple_logger = "2.1.0"
+log = "0.4.14"
+dashmap = "5"
+bytes = "1"
+hyper = { version = "0.14", features = ["full", "server"] }
+tokio = { version = "1", features = ["full", "tracing"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+prometheus = "0.13"
+getopts = "0.2"
+net2 = "0.2"
+rand = "0.8.4"
+lazy_static = "1.4"
+console-subscriber = "0.2"
+jemallocator = { version = "0.5", optional = true }
+
+[features]
+default = ["jemalloc"]
+jemalloc = []
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+jemallocator = { version = "0.5" }
+
+[dev-dependencies]
+average = "0.13"
