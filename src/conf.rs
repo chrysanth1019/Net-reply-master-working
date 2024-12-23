@@ -1,7 +1,9 @@
+use dotenv::dotenv;
 use getopts::Options;
 use log::error;
 use std::env;
 use std::sync::Arc;
+
 pub struct Config {
     pub proxy_mode: u8,                      // 1 for sticky, 2 for non-sticky
     pub allowed_locations: Arc<Vec<String>>, // Comma-separated list of allowed countries
@@ -10,8 +12,10 @@ pub struct Config {
     pub socks_addr: String,                  // Address for SOCKS5 client connections
     pub metrics_addr: String,
 }
-
 pub fn parse_args() -> Config {
+    // Load environment variables from .env file
+    dotenv().ok();
+
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
 
@@ -54,7 +58,10 @@ pub fn parse_args() -> Config {
     });
 
     // Parse proxy_mode (stick or nonstick)
-    let proxy_mode: String = matches.opt_str("p").unwrap_or_else(|| "stick".to_string());
+    let proxy_mode: String = matches
+        .opt_str("p")
+        .unwrap_or_else(|| env::var("PROXY_MODE").unwrap_or_else(|_| "stick".to_string()));
+
     let client_assign_mode: u8 = match proxy_mode.as_str() {
         "stick" => 1,
         "nonstick" => 2,
@@ -68,7 +75,7 @@ pub fn parse_args() -> Config {
     let allowed_locations = Arc::new(
         matches
             .opt_str("l")
-            .unwrap_or_default()
+            .unwrap_or_else(|| env::var("ALLOWED_LOCATIONS").unwrap_or_default())
             .split(',')
             .filter_map(|loc| {
                 let trimmed = loc.trim();
@@ -82,18 +89,22 @@ pub fn parse_args() -> Config {
     );
 
     // Determine the verbosity level
-    let verbosity = matches.opt_str("v").unwrap_or_else(|| "info".to_string());
+    let verbosity = matches
+        .opt_str("v")
+        .unwrap_or_else(|| env::var("VERBOSITY").unwrap_or_else(|_| "info".to_string()));
 
     // Parse the master and socks server addresses
     let master_addr = matches
         .opt_str("t")
-        .unwrap_or_else(|| "0.0.0.0:8001".to_string());
+        .unwrap_or_else(|| env::var("MASTER_ADDR").unwrap_or_else(|_| "0.0.0.0:8001".to_string()));
+
     let socks_addr = matches
         .opt_str("s")
-        .unwrap_or_else(|| "0.0.0.0:1081".to_string());
+        .unwrap_or_else(|| env::var("SOCKS_ADDR").unwrap_or_else(|_| "0.0.0.0:1081".to_string()));
+
     let metrics_addr = matches
         .opt_str("m")
-        .unwrap_or_else(|| "0.0.0.0:9091".to_string());
+        .unwrap_or_else(|| env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_string()));
 
     Config {
         proxy_mode: client_assign_mode,
