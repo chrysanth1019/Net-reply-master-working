@@ -1,0 +1,14 @@
+[Unit]
+Description=Relay Service
+After=network.target
+
+[Service]
+ExecStart=/home/ihor/Net-reply-master-working/target/release/net-relay
+WorkingDirectory=/home/ihor/Net-reply-master-working/target/release
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
