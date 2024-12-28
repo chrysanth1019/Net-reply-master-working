@@ -1,13 +1,17 @@
+use bytes::BytesMut;
+use log::debug;
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Token(pub u8);
+pub struct Token(pub u32);
 
 pub trait Balance {
     type State;
 
-    fn new(weights: &[u8], tokens: &[u8]) -> Self;
+    fn new(weights: &[u32], tokens: &[u32]) -> Self;
     fn next(&self, state: &Self::State) -> Option<Token>;
 }
 
@@ -20,15 +24,15 @@ struct Node {
 #[derive(Debug)]
 pub struct IpHash {
     nodes: Vec<Node>,
-    total: u8,
+    total: u32,
 }
 
 impl Balance for IpHash {
     type State = IpAddr;
 
-    fn new(weights: &[u8], tokens: &[u8]) -> Self {
-        assert!(weights.len() <= u8::MAX as usize);
-        assert!(tokens.len() <= u8::MAX as usize);
+    fn new(weights: &[u32], tokens: &[u32]) -> Self {
+        assert!(weights.len() <= u32::MAX as usize);
+        assert!(tokens.len() <= u32::MAX as usize);
 
         assert_eq!(
             tokens.len(),
@@ -38,17 +42,17 @@ impl Balance for IpHash {
             weights.len()
         );
 
-        if weights.len() == 0 {
+        if weights.is_empty() {
             return Self {
                 nodes: Vec::new(),
-                total: weights.len() as u8,
+                total: 0,
             };
         }
 
         if weights.len() == 1 {
             // Single-node special case: Add a single node with the given token
             let token = Token(tokens[0]);
-            let hash = chash(&[token.0]); // Use token as the input for hash
+            let hash = chash(&token.0.to_le_bytes()); // Use token as the input for hash
             return Self {
                 nodes: vec![Node { hash, token }],
                 total: 1,
@@ -56,7 +60,7 @@ impl Balance for IpHash {
         }
 
         let ratio = replica_ratio(weights);
-        let count = weights.iter().map(|x| *x as usize * ratio as usize).sum();
+        let count = weights.iter().map(|&x| x * ratio).sum::<u32>() as usize;
         let mut nodes: Vec<Node> = Vec::with_capacity(count);
 
         for (token, weight) in tokens.iter().zip(weights.iter()) {
@@ -76,7 +80,7 @@ impl Balance for IpHash {
 
         Self {
             nodes,
-            total: weights.len() as u8,
+            total: weights.len() as u32,
         }
     }
 
@@ -106,24 +110,24 @@ impl Balance for IpHash {
 
 #[derive(Debug)]
 struct RRNode {
-    cw: i16,
-    ew: u8,
-    weight: u8,
+    cw: i64,
+    ew: u32,
+    weight: u32,
     token: Token,
 }
 
 #[derive(Debug)]
 pub struct RoundRobin {
     nodes: Mutex<Vec<RRNode>>,
-    total: u8,
+    total: u32,
 }
 
 impl Balance for RoundRobin {
     type State = ();
 
-    fn new(weights: &[u8], tokens: &[u8]) -> Self {
-        assert!(weights.len() <= u8::MAX as usize);
-        assert!(tokens.len() <= u8::MAX as usize);
+    fn new(weights: &[u32], tokens: &[u32]) -> Self {
+        assert!(weights.len() <= u32::MAX as usize);
+        assert!(tokens.len() <= u32::MAX as usize);
 
         assert_eq!(
             tokens.len(),
@@ -153,7 +157,7 @@ impl Balance for RoundRobin {
 
         Self {
             nodes: Mutex::new(nodes),
-            total: weights.len() as u8,
+            total: weights.len() as u32,
         }
     }
 
@@ -166,18 +170,21 @@ impl Balance for RoundRobin {
         }
 
         let mut nodes = self.nodes.lock().unwrap();
-        let mut tw: i16 = 0; // Total weight
+        let mut tw: i64 = 0; // Total weight
         let mut best: Option<&mut RRNode> = None;
 
         for node in nodes.iter_mut() {
-            tw += node.ew as i16; // Accumulate total weight
-            node.cw += node.ew as i16; // Increment current weight by effective weight
+            tw += node.ew as i64; // Accumulate total weight
+            node.cw += node.ew as i64; // Increment current weight by effective weight
 
             if node.ew < node.weight {
                 node.ew += 1; // Slowly restore the effective weight
             }
 
-            if best.as_ref().map_or(true, |best_node| node.cw > best_node.cw) {
+            if best
+                .as_ref()
+                .map_or(true, |best_node| node.cw > best_node.cw)
+            {
                 best = Some(node);
             }
         }
@@ -188,7 +195,7 @@ impl Balance for RoundRobin {
         }
 
         None
-    }     
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,10 +215,12 @@ pub enum Balancer {
 }
 
 impl Balancer {
-    pub fn new(strategy: Strategy, weights: &[u8], tokens: &[u8]) -> Self {
+    pub fn new(strategy: Strategy, weights: &[u32], tokens: &[u32]) -> Self {
         match strategy {
             Strategy::IpHash => Balancer::IpHash(Arc::new(IpHash::new(weights, tokens))),
-            Strategy::RoundRobin => Balancer::RoundRobin(Arc::new(RoundRobin::new(weights, tokens))),
+            Strategy::RoundRobin => {
+                Balancer::RoundRobin(Arc::new(RoundRobin::new(weights, tokens)))
+            }
         }
     }
 
@@ -282,14 +291,14 @@ mod chash {
 }
 
 // Replication ratio for virtual nodes
-fn replica_ratio(weights: &[u8]) -> u8 {
-    const MIN_REPLICA: u8 = 128;
+fn replica_ratio(weights: &[u32]) -> u32 {
+    const MIN_REPLICA: u32 = 128;
     let max = *weights.iter().max().unwrap();
 
     if max >= MIN_REPLICA {
         1
     } else {
-        f64::ceil(MIN_REPLICA as f64 / max as f64) as u8
+        f64::ceil(MIN_REPLICA as f64 / max as f64) as u32
     }
 }
 
@@ -400,18 +409,22 @@ mod tests {
     fn iphash_single_node() {
         let iphash = IpHash::new(&[10], &[1]);
         let ip = "192.168.1.1".parse::<IpAddr>().unwrap();
-    
+
         assert_eq!(iphash.next(&ip), Some(Token(1)));
     }
 
     #[test]
     fn ih_same_weight() {
-        let tokens: Vec<u8> = (0..=15).collect();
+        let tokens: Vec<u32> = (0..=15).collect();
         let iphash = IpHash::new(&vec![1; 16], &tokens);
         let mut distro = [0f64; 16];
 
         let mut total: usize = 0;
-        for ip in (0..=u32::MAX).map(Ipv4Addr::from).map(IpAddr::from).step_by(127) {
+        for ip in (0..=u32::MAX)
+            .map(Ipv4Addr::from)
+            .map(IpAddr::from)
+            .step_by(127)
+        {
             let token = iphash.next(&ip).unwrap();
             distro[token.0 as usize] += 1 as f64;
             total += 1;
@@ -435,13 +448,17 @@ mod tests {
 
     #[test]
     fn ih_all_weights() {
-        let weights: Vec<u8> = (1..=16).collect();
-        let tokens: Vec<u8> = (0..=15).collect();
+        let weights: Vec<u32> = (1..=16).collect();
+        let tokens: Vec<u32> = (0..=15).collect();
         let iphash = IpHash::new(&weights, &tokens);
         let mut distro = [0f64; 16];
 
         let mut total: usize = 0;
-        for ip in (0..=u32::MAX).map(Ipv4Addr::from).map(IpAddr::from).step_by(127) {
+        for ip in (0..=u32::MAX)
+            .map(Ipv4Addr::from)
+            .map(IpAddr::from)
+            .step_by(127)
+        {
             let token = iphash.next(&ip).unwrap();
             distro[token.0 as usize] += 1 as f64;
             total += 1;
@@ -469,11 +486,11 @@ mod tests {
         let rr = RoundRobin::new(&[10], &[3]);
         assert_eq!(rr.next(&()), Some(Token(3)));
     }
-    
+
     // Test equal weights for uniform distribution.
     #[test]
     fn rr_same_weight() {
-        let tokens: Vec<u8> = (0..=254).collect();
+        let tokens: Vec<u32> = (0..=254).collect();
         let rr = RoundRobin::new(&vec![1; 255], &tokens); // 255 nodes with weight 1
         let mut distro = [0f64; 255];
 
@@ -502,8 +519,8 @@ mod tests {
     /// Test unequal weights for proportional distribution.
     #[test]
     fn rr_all_weights() {
-        let weights: Vec<u8> = (1..=255).collect(); // Increasing weights from 1 to 255
-        let tokens: Vec<u8> = (0..=254).collect();
+        let weights: Vec<u32> = (1..=255).collect(); // Increasing weights from 1 to 255
+        let tokens: Vec<u32> = (0..=254).collect();
         let total_weight: f64 = weights.iter().map(|&w| w as f64).sum();
         let rr = RoundRobin::new(&weights, &tokens);
         let mut distro = [0f64; 255];
@@ -529,5 +546,72 @@ mod tests {
         println!("min diff: {}", min_diff.min());
         println!("max diff: {}", max_diff.max());
         println!("mean diff: {}", mean_diff.mean());
+    }
+}
+
+pub const MAX_BUF_SIZE: usize = 8192;
+pub const POOL_SIZE: usize = 200;
+
+// Sharded Buffer Pool for high concurrency
+#[derive(Clone)]
+pub struct ShardedBufferPool {
+    shards: Vec<Arc<BufferPoolShard>>,
+}
+
+impl ShardedBufferPool {
+    pub fn new(num_shards: usize, pool_size: usize) -> Self {
+        let shards = (0..num_shards)
+            .map(|_| Arc::new(BufferPoolShard::new(pool_size)))
+            .collect();
+        Self { shards }
+    }
+
+    pub async fn get_buffer(&self, id: usize) -> BytesMut {
+        let shard = &self.shards[id % self.shards.len()];
+        shard.get_buffer().await
+    }
+
+    pub async fn return_buffer(&self, id: usize, buffer: BytesMut) {
+        let shard = &self.shards[id % self.shards.len()];
+        shard.return_buffer(buffer).await;
+    }
+}
+
+struct BufferPoolShard {
+    buffers: AsyncMutex<VecDeque<BytesMut>>,
+}
+
+impl BufferPoolShard {
+    fn new(pool_size: usize) -> Self {
+        let mut buffers = VecDeque::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            buffers.push_back(BytesMut::with_capacity(MAX_BUF_SIZE));
+        }
+        Self {
+            buffers: AsyncMutex::new(buffers),
+        }
+    }
+
+    async fn get_buffer(&self) -> BytesMut {
+        let mut buffers = self.buffers.lock().await;
+        if let Some(mut buffer) = buffers.pop_front() {
+            if buffer.capacity() < MAX_BUF_SIZE {
+                buffer = BytesMut::with_capacity(MAX_BUF_SIZE);
+            } else {
+                buffer.clear(); // Prepare buffer for reuse
+            }
+            buffer
+        } else {
+            BytesMut::with_capacity(MAX_BUF_SIZE)
+        }
+    }
+
+    async fn return_buffer(&self, buffer: BytesMut) {
+        let mut buffers = self.buffers.lock().await;
+        if buffers.len() < POOL_SIZE {
+            buffers.push_back(buffer);
+        } else {
+            debug!("Buffer pool full, discarding buffer");
+        }
     }
 }

@@ -1,40 +1,33 @@
 use crate::buffer_pool::ShardedBufferPool;
+use crate::load_balancing::{BalanceCtx, Balancer, Strategy};
 use crate::metrics::Metrics;
 use crate::packet::{
-    parse_header,
+    build_data_frame, build_heartbeat_command, build_init_session_command, parse_header,
     process_packet,
-    build_heartbeat_command,
-    build_init_session_command,
-    build_data_frame
 };
 use crate::socks5::handle_client_handshake;
-use crate::load_balancing::{
-    Balancer,
-    BalanceCtx,
-    Strategy
-};
-use crate::utils::{
-    hash_ip,
-    CLIENT_REQUEST_TIMEOUT
-};
+use crate::utils::{hash_ip, CLIENT_REQUEST_TIMEOUT};
 
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error, info, trace, warn};
-use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::TcpStream};
-use tokio::time::{Duration, Instant, timeout};
-use std::sync::Arc;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, Ordering};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, Semaphore};
-use bytes::{BytesMut, Bytes, Buf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
+use tokio::time::{timeout, Duration, Instant};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 const KEEP_ALIVE_DURATION: u64 = 10;
 
 #[derive(Clone)]
 pub struct Slave {
     pub ip_addr: String,
-    pub id_token: u8,
+    pub id_token: u32,
     pub version: Option<String>,
     pub location: Option<String>,
     // Weight for round robin
@@ -104,11 +97,11 @@ impl Client {
 pub struct ProxyManager {
     pub slaves: DashMap<String, Slave>, // ID String -> Slave
     pub clients: DashMap<u32, Client>,  // Map SessionId -> Client
-    
+
     // Load balancing strategy
     pub balancer: Arc<AsyncMutex<Balancer>>,
     pub balancing_strategy: Strategy,
-    token_counter: AtomicU8,
+    token_counter: AtomicU32,
 }
 
 impl ProxyManager {
@@ -124,27 +117,27 @@ impl ProxyManager {
             clients: DashMap::new(),
             balancer: Arc::new(AsyncMutex::new(Balancer::new(strategy, &[], &[]))),
             balancing_strategy: strategy,
-            token_counter: AtomicU8::new(0),
+            token_counter: AtomicU32::new(0),
         }
     }
 
-    pub fn generate_token(&self) -> u8 {
+    pub fn generate_token(&self) -> u32 {
         self.token_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn update_balancer(&mut self) {
-        let weights: Vec<u8> = self
+        let weights: Vec<u32> = self
             .slaves
             .iter()
-            .map(|entry| entry.value().net_speed as u8)
+            .map(|entry| entry.value().net_speed as u32)
             .collect();
 
-        let tokens: Vec<u8> = self
+        let tokens: Vec<u32> = self
             .slaves
             .iter()
-            .map(|entry| entry.value().id_token as u8)
+            .map(|entry| entry.value().id_token as u32)
             .collect();
-    
+
         let mut balancer = self.balancer.lock().await;
         *balancer = Balancer::new(self.balancing_strategy, &weights, &tokens);
     }
@@ -157,7 +150,7 @@ impl ProxyManager {
         self.update_balancer().await;
     }
 
-    pub async fn remove_slave(&mut self, slave_id_token: &u8) {
+    pub async fn remove_slave(&mut self, slave_id_token: &u32) {
         self.slaves.remove(&slave_id_token.to_string());
         self.update_balancer().await;
     }
@@ -170,12 +163,18 @@ impl ProxyManager {
     ) -> Option<mpsc::Sender<Bytes>> {
         trace!(
             "Finding available slave for client IP: {}, Requested location: {:?}",
-            client_ip, requested_location
+            client_ip,
+            requested_location
         );
-    
+
         match IpAddr::from_str(client_ip) {
             Ok(parsed_ip) => {
-                if let Some(token) = self.balancer.lock().await.next(BalanceCtx { src_ip: &parsed_ip }) {
+                if let Some(token) = self
+                    .balancer
+                    .lock()
+                    .await
+                    .next(BalanceCtx { src_ip: &parsed_ip })
+                {
                     if let Some(slave) = self.slaves.get(&token.0.to_string()) {
                         debug!(
                             "Found slave: {}, Token: {}, Location: {:?}",
@@ -184,7 +183,7 @@ impl ProxyManager {
 
                         // Handle location filtering
                         if let Some(requested_location) = requested_location {
-                            if let Some(slave_location) = &slave.location {   
+                            if let Some(slave_location) = &slave.location {
                                 if slave_location.eq_ignore_ascii_case(requested_location) {
                                     return Some(slave.tx.clone());
                                 } else {
@@ -221,10 +220,16 @@ impl ProxyManager {
     pub async fn route_to_client(&self, session_id: u32, payload: Bytes) {
         if let Some(client) = self.clients.get(&session_id) {
             if let Err(e) = client.to_client_tx.send(payload).await {
-                error!("Failed to send to client mpsc channel: session id: {}: {}", session_id, e);
+                error!(
+                    "Failed to send to client mpsc channel: session id: {}: {}",
+                    session_id, e
+                );
             }
         } else {
-            trace!("No client found with session ID {}. Dropping data.", session_id);
+            trace!(
+                "No client found with session ID {}. Dropping data.",
+                session_id
+            );
         }
     }
 }
@@ -271,7 +276,7 @@ pub async fn handle_slave_io(
                     // Process the packet with the current_packet_type and current_command_type
                     let payload = buffer.split_to(payload_len).freeze();
 
-                    trace!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}", 
+                    trace!("Processing packet from slave: {} | PacketType: {:?} | CommandType: {:?}",
                           slave.ip_addr, current_packet_type, current_command_type);
 
                     if let Err(_err) = process_packet(
@@ -319,12 +324,16 @@ pub async fn handle_slave_io(
             }
         }
     }
-    
+
     buffer_pool.return_buffer(shard_id, buffer).await;
 
     // Handle disconnection
     info!("Slave {} disconnected", slave.ip_addr);
-    proxy_manager.lock().await.remove_slave(&slave.id_token).await;
+    proxy_manager
+        .lock()
+        .await
+        .remove_slave(&slave.id_token)
+        .await;
 
     metrics.slave_active_connections.dec();
     metrics.slave_disconnections.inc();
@@ -351,7 +360,7 @@ pub async fn handle_client_io(
                 session_id, result.0, result.1, result.2
             );
             result
-        },
+        }
         Err(e) => {
             debug!(
                 "Error during SOCKS5 handshake for session {}: {}",
@@ -361,8 +370,13 @@ pub async fn handle_client_io(
         }
     };
 
-    let slave_tx = proxy_manager.lock().await
-        .get_available_slave_tx(&cli_stream.local_addr()?.ip().to_string(), username.as_ref())
+    let slave_tx = proxy_manager
+        .lock()
+        .await
+        .get_available_slave_tx(
+            &cli_stream.local_addr()?.ip().to_string(),
+            username.as_ref(),
+        )
         .await;
 
     let slave_tx = match slave_tx {
@@ -394,7 +408,11 @@ pub async fn handle_client_io(
     }
 
     // Add client session
-    proxy_manager.lock().await.clients.insert(session_id, client.clone());
+    proxy_manager
+        .lock()
+        .await
+        .clients
+        .insert(session_id, client.clone());
 
     let shard_id = session_id as usize;
 
